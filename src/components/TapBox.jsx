@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 
-const API_BASE = window.__JIRASAN_API_BASE__ || 'http://localhost:8001';
+// Empowor endpoints and config
+const API_BASE = window.__EMPOWOR_API_BASE__ || 'https://vxo167lu1j.execute-api.us-east-1.amazonaws.com';
+const FE_BASE = window.__EMPOWOR_FE_BASE__ || 'https://empowor.s3-website-us-east-1.amazonaws.com';
 const TOKEN_ADDRESS = '0x67B4511a0E3eFFaFa2593cC96A5089D26e25DFD6';
 
 export default function TapBox() {
@@ -22,12 +24,12 @@ export default function TapBox() {
       if (!resp.ok) throw new Error((await resp.json()).detail || 'Auth failed');
       const data = await resp.json();
       setProviderToken(data.access_token);
-      localStorage.setItem('snake_game_provider_token', data.access_token);
+      localStorage.setItem('provider_access_token', data.access_token);
       return data.access_token;
     } catch (e) { setError(e.message); return null; } finally { setLoading(false); }
   }, []);
 
-  const getProviderToken = () => providerToken || localStorage.getItem('snake_game_provider_token');
+  const getProviderToken = () => providerToken || localStorage.getItem('provider_access_token');
   const isProviderAuthenticated = () => !!getProviderToken();
 
   const checkProviderApproval = useCallback(async () => {
@@ -54,7 +56,7 @@ export default function TapBox() {
       if (!isProviderAuthenticated()) { const tok = await loginProvider(); if (!tok) return false; }
       const token = getProviderToken();
       const userId = localStorage.getItem('user_id');
-      const payload = { user_id: userId, event_name: 'Snake_Game', event_type: eventType, amount, token_address: TOKEN_ADDRESS };
+      const payload = { user_id: userId, event_name: 'Xplosion_Casino', event_type: eventType, amount, token_address: TOKEN_ADDRESS };
       const resp = await fetch(`${API_BASE}/register-event`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(payload) });
       const data = await resp.json();
       if (!resp.ok || !data.success) throw new Error(data.message || 'Failed to register event');
@@ -63,8 +65,18 @@ export default function TapBox() {
   }, [loginProvider]);
 
   useEffect(() => {
-    const tok = localStorage.getItem('snake_game_provider_token');
+    const tok = localStorage.getItem('provider_access_token');
     if (tok) setProviderToken(tok);
+    // Token bridge so overlay can request user_token
+    const bridge = (ev) => {
+      if (!ev || !ev.data) return;
+      if (ev.data.type === 'empowor_request_token') {
+        const tok = localStorage.getItem('user_token') || null;
+        ev.source && ev.source.postMessage({ type: 'empowor_user_token', user_token: tok }, '*');
+      }
+    };
+    window.addEventListener('message', bridge);
+    return () => window.removeEventListener('message', bridge);
   }, []);
 
   const start = async () => {
@@ -73,10 +85,61 @@ export default function TapBox() {
       if (!userId) { setError('Please log in first'); return; }
       const ok = await checkProviderApproval(); if (!ok.success) return;
       setLoading(true); setError('');
-      const sdk = window.Jirasan;
-      if (!sdk || !sdk.requestExpense) { setError('SDK not loaded'); setLoading(false); return; }
-      const res = await sdk.requestExpense({ amount: 5, tokenAddress: TOKEN_ADDRESS, description: 'Tap Box Fee', eventName: 'Snake_Game' });
-      if (!res || res.status !== 'approved') { setError('Expense not approved'); setLoading(false); return; }
+
+      // Ensure provider token
+      let providerTok = getProviderToken();
+      if (!providerTok) providerTok = await loginProvider();
+      if (!providerTok) { setLoading(false); return; }
+
+      // 1) Create expense intent (provider bearer)
+      const createIntent = async () => {
+        const resp = await fetch(`${API_BASE}/expense/intent.create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${providerTok}` },
+          body: JSON.stringify({ amount: 5, token_address: TOKEN_ADDRESS, description: 'Tap Box Fee', expires_in: 600, event_name: 'Snake_Game' })
+        });
+        return resp;
+      };
+
+      let resp = await createIntent();
+      if (resp.status === 403) {
+        providerTok = await loginProvider();
+        if (!providerTok) { setLoading(false); return; }
+        resp = await createIntent();
+      }
+      const data = await resp.json();
+      if (!resp.ok || !data.success || !data.approval_link) {
+        setError(data.message || 'Failed to create expense intent'); setLoading(false); return;
+      }
+
+      // 2) Normalize approval link to hosted overlay
+      let approvalUrl = data.approval_link;
+      try {
+        const u = new URL(approvalUrl);
+        if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
+          const id = u.searchParams.get('intent_id');
+          if (id) approvalUrl = `${FE_BASE}/#/overlay?intent_id=${encodeURIComponent(id)}`;
+        }
+      } catch {}
+
+      // 3) Load SDK if needed and init
+      await new Promise((resolve) => {
+        if (window.Empowor) return resolve(true);
+        const s = document.createElement('script');
+        s.src = `${FE_BASE}/empowor-sdk.js`;
+        s.onload = () => resolve(true);
+        document.head.appendChild(s);
+      });
+      window.Empowor && window.Empowor.init({
+        apiBase: API_BASE,
+        getAccessToken: () => localStorage.getItem('provider_access_token'),
+        getUserToken: () => localStorage.getItem('user_token')
+      });
+
+      // 4) Open overlay and await approval
+      const result = await window.Empowor._openOverlay(approvalUrl);
+      if (!result || result.status !== 'approved') { setError('Expense not approved'); setLoading(false); return; }
+
       // Backend registers EVENT_LOSS on approve; now start game
       setScore(0); setPhase('playing'); setLoading(false);
     } catch (e) { setError(e.message); setLoading(false); }
